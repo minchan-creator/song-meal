@@ -7,6 +7,8 @@
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Black+Han+Sans&family=IBM+Plex+Sans+KR:wght@400;500;700&family=IBM+Plex+Mono:wght@500&display=swap">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 /* Layout: 레코드 가게 진열대. 왼쪽 '턴테이블'(입력) → 오른쪽 '오늘의 한 끼'(결과), 아래로 기획 내용이 트랙리스트처럼 이어진다 */
 :root{
@@ -83,6 +85,15 @@ input[type=text]{width:100%;font:16px var(--body);color:var(--ink);background:va
 .loc-row{display:flex;gap:8px;flex-wrap:wrap}
 .loc-row input{flex:1 1 180px;min-width:0}
 .ghost{border:1px solid var(--ink);background:transparent;color:var(--ink);font:500 14px var(--body);padding:9px 14px;border-radius:8px;cursor:pointer}
+#map{height:340px;max-width:100%;border-radius:12px;border:1px solid var(--line);z-index:0;background:var(--chip)}
+.leaflet-popup-content{font-family:var(--body)}
+.pin-num{color:var(--accent-ink);font:700 11px/18px var(--mono);text-align:center;pointer-events:auto}
+.nearby{list-style:none;margin:0;padding:0;display:grid;gap:4px}
+.nearby button{width:100%;display:grid;grid-template-columns:24px minmax(0,1fr) auto;gap:10px;align-items:center;text-align:left;border:0;background:transparent;color:var(--ink);font:15px var(--body);padding:8px 6px;border-bottom:1px solid var(--line);cursor:pointer}
+.nearby button:hover{background:var(--chip)}
+.nearby .no{font-family:var(--mono);font-size:12px;background:var(--accent);color:var(--accent-ink);border-radius:50%;width:22px;height:22px;display:grid;place-items:center}
+.nearby .nm{overflow-wrap:anywhere}
+.nearby small{font-family:var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
 .links{display:grid;gap:6px;margin:0;padding:0;list-style:none}
 .links a{display:flex;justify-content:space-between;gap:12px;align-items:center;text-decoration:none;color:var(--ink);background:var(--chip);padding:10px 14px;border-radius:8px}
 .links a:hover{background:color-mix(in srgb,var(--chip) 70%,var(--accent))}
@@ -183,11 +194,14 @@ footer{color:var(--muted);font-size:13px;border-top:1px solid var(--line);paddin
 
       <div class="places">
         <div class="label">이 메뉴를 파는 가까운 음식점</div>
-        <div class="loc-row">
+        <form class="loc-row" id="loc-form">
           <input type="text" id="region" placeholder="동네 이름 (예: 망원동)" aria-label="동네 이름">
-          <button type="button" class="ghost" id="gps">현재 위치 사용</button>
-        </div>
-        <p class="hint" id="loc-msg">동네를 입력하면 네이버 지도에서 해당 지역의 음식점을 찾아줍니다. 비워두면 네이버 지도가 내 위치 주변을 보여줍니다.</p>
+          <button type="submit" class="ghost">찾기</button>
+          <button type="button" class="ghost" id="gps">현재 위치</button>
+        </form>
+        <p class="hint" id="loc-msg">동네 이름을 입력하거나 '현재 위치'를 누르면 주변 음식점을 지도에 표시해요.</p>
+        <div id="map" aria-label="주변 음식점 지도"></div>
+        <ol class="nearby" id="nearby"></ol>
         <ul class="links" id="links"></ul>
       </div>
     </article>
@@ -261,30 +275,98 @@ function show(menu,why,alts,now){
   current={menu,alts};
   $("now").textContent=now;$("menu").textContent=menu;$("why").textContent=why;
   $("alts").innerHTML="";
-  alts.forEach(a=>{const b=document.createElement("button");b.type="button";b.textContent=a;b.onclick=()=>{$("menu").textContent=a;current.menu=a;renderLinks()};$("alts").append(b)});
-  renderLinks();
+  alts.forEach(a=>{const b=document.createElement("button");b.type="button";b.textContent=a;b.onclick=()=>{$("menu").textContent=a;current.menu=a;menuChanged()};$("alts").append(b)});
+  menuChanged();
 }
+function menuChanged(){renderLinks();if(here)searchNearby()}
 function renderLinks(){
   const r=$("region").value.trim(),m=current.menu;
   const q=r?`${r} ${m}`:m;
-  const items=[
-    ["네이버 지도에서 보기",`https://map.naver.com/p/search/${encodeURIComponent(q)}`,"지도·마커"],
-    ["네이버 검색 결과",`https://search.naver.com/search.naver?query=${encodeURIComponent(q+" 맛집")}`,"리뷰"]
-  ];
-  $("links").innerHTML=items.map(([t,u,s])=>`<li><a href="${u}" target="_blank" rel="noopener"><span>${t}: <b></b></span><small>${s} ↗</small></a></li>`).join("");
-  $("links").querySelectorAll("b").forEach(b=>b.textContent=q+(r?"":" (내 주변)"));
+  $("links").innerHTML=`<li><a href="https://map.naver.com/p/search/${encodeURIComponent(q)}" target="_blank" rel="noopener"><span>네이버 지도에서 더 찾아보기: <b></b></span><small>↗</small></a></li>`;
+  $("links").querySelector("b").textContent=q;
+}
+
+/* 지도: OpenStreetMap 지도 + 음식점 데이터(Overpass) */
+const CUISINE={"치킨":"chicken","초밥":"sushi","연어덮밥":"japanese","라멘":"ramen","우동":"japanese","소바":"japanese","돈가스":"japanese",
+  "짜장면":"chinese","짬뽕":"chinese","탕수육":"chinese","마라탕":"chinese","중국냉면":"chinese","햄버거":"burger","파스타":"italian|pasta",
+  "샐러드 파스타":"italian|pasta","크림 리조또":"italian","피자":"pizza","쌀국수":"vietnamese","카레":"indian|curry","팬케이크":"pancake|brunch|cafe",
+  "샌드위치":"sandwich","포케":"poke|hawaiian","팥빙수":"dessert|ice_cream|cafe","스튜":"western|european"};
+const NAMEKEY={"삼겹살":"삼겹|고기|돼지|구이","김치찌개":"찌개|김치","부대찌개":"부대","순두부찌개":"순두부","소고기국밥":"국밥|순대","해물파전":"전|파전|막걸리",
+  "부침개":"전|파전|막걸리","어묵탕":"어묵|오뎅|이자카야","라볶이":"분식|떡볶이","김밥":"김밥|분식","쫄면":"분식|쫄면","떡볶이":"떡볶이|분식","야식 족발":"족발|보쌈",
+  "라면":"라면|분식","칼국수":"칼국수|국수","냉면":"냉면|면옥","비빔밥":"비빔밥|한식","제육볶음":"제육|백반|한식","오므라이스":"오므라이스|경양식","팥빙수":"빙수|설빙",
+  "치킨":"치킨|통닭","마라탕":"마라","햄버거":"버거","초밥":"스시|초밥","라멘":"라멘","돈가스":"돈가스|돈까스|카츠","쌀국수":"쌀국수|포|베트남","카레":"카레|커리"};
+let here=null,map=null,layer=null,reqId=0;
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function initMap(){
+  if(map||!window.L)return;
+  map=L.map("map",{scrollWheelZoom:false}).setView([37.5663,126.9779],13);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'}).addTo(map);
+  layer=L.layerGroup().addTo(map);
+}
+function dist(a,b){const R=6371e3,r=x=>x*Math.PI/180,dl=r(b[0]-a[0]),dn=r(b[1]-a[1]);
+  const h=Math.sin(dl/2)**2+Math.cos(r(a[0]))*Math.cos(r(b[0]))*Math.sin(dn/2)**2;return 2*R*Math.asin(Math.sqrt(h))}
+const fmt=m=>m<1000?`${Math.round(m/10)*10}m`:`${(m/1000).toFixed(1)}km`;
+const esc=t=>String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+async function searchNearby(){
+  initMap();if(!here)return;
+  if(!map){$("loc-msg").textContent="지도를 불러오지 못했어요. 아래 네이버 지도 링크를 이용해 주세요.";return}
+  const id=++reqId,menu=current.menu,msg=$("loc-msg");
+  msg.textContent=`주변에서 '${menu}' 가게를 찾는 중이에요…`;
+  layer.clearLayers();$("nearby").innerHTML="";
+  L.circleMarker(here,{radius:8,color:"#fff",weight:3,fillColor:"#2a6fdb",fillOpacity:1}).addTo(layer).bindPopup("기준 위치");
+  map.setView(here,15);
+  const q=`[out:json][timeout:25];nwr["amenity"~"^(restaurant|fast_food|cafe|food_court|ice_cream)$"](around:1500,${here[0]},${here[1]});out center 400;`;
+  let els;
+  try{const r=await fetch("https://overpass-api.de/api/interpreter",{method:"POST",body:"data="+encodeURIComponent(q)});
+    if(!r.ok)throw 0;els=(await r.json()).elements}
+  catch(e){if(id===reqId)msg.textContent="음식점 정보를 불러오지 못했어요. 잠시 뒤 다시 시도하거나 아래 네이버 지도 링크를 이용해 주세요.";return}
+  if(id!==reqId)return;
+  const nameRe=new RegExp(NAMEKEY[menu]||menu.replace(/^야식 /,"").split(" ").pop());
+  const cuiRe=CUISINE[menu]?new RegExp(CUISINE[menu],"i"):null;
+  const all=els.map(e=>{const t=e.tags||{},p=e.center?[e.center.lat,e.center.lon]:[e.lat,e.lon];
+      return {name:t["name:ko"]||t.name,cuisine:t.cuisine||"",amenity:t.amenity,p,d:dist(here,p)}})
+    .filter(x=>x.name&&x.p[0]);
+  let hits=all.filter(x=>nameRe.test(x.name)||(cuiRe&&cuiRe.test(x.cuisine)));
+  let exact=true;
+  if(!hits.length){hits=all.filter(x=>x.amenity!=="cafe");exact=false}
+  hits.sort((a,b)=>a.d-b.d);hits=hits.slice(0,10);
+  if(!hits.length){msg.textContent="반경 1.5km 안에서 음식점 정보를 찾지 못했어요. 다른 동네로 검색해 보세요.";return}
+  msg.textContent=exact?`'${menu}'와(과) 어울리는 가게 ${hits.length}곳을 가까운 순으로 찾았어요. (반경 1.5km)`
+    :`지도 데이터에 '${menu}' 가게가 없어 가까운 음식점 ${hits.length}곳을 보여드려요.`;
+  const acc=css("--accent")||"#e2a30c",ink=css("--groove")||"#18213a";
+  const bounds=[here];
+  hits.forEach((h,i)=>{
+    const m=L.circleMarker(h.p,{radius:9,color:ink,weight:2,fillColor:acc,fillOpacity:1}).addTo(layer)
+      .bindPopup(`<b>${esc(h.name)}</b><br>${fmt(h.d)} · <a href="https://map.naver.com/p/search/${encodeURIComponent(h.name)}" target="_blank" rel="noopener">네이버 지도</a>`);
+    L.marker(h.p,{icon:L.divIcon({className:"pin-num",html:String(i+1),iconSize:[18,18]})}).addTo(layer).on("click",()=>m.openPopup());
+    bounds.push(h.p);
+    const li=document.createElement("li");
+    li.innerHTML=`<button type="button"><span class="no">${i+1}</span><span class="nm">${esc(h.name)}</span><small>${fmt(h.d)}</small></button>`;
+    li.querySelector("button").onclick=()=>{map.setView(h.p,17);m.openPopup();$("map").scrollIntoView({block:"nearest",behavior:"smooth"})};
+    $("nearby").append(li);
+  });
+  map.fitBounds(bounds,{padding:[30,30],maxZoom:16});
+}
+async function geocode(r){
+  const msg=$("loc-msg");msg.textContent=`'${r}' 위치를 찾는 중이에요…`;
+  try{const res=await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=kr&accept-language=ko&q=${encodeURIComponent(r)}`);
+    const j=await res.json();if(!j.length){msg.textContent=`'${r}'을(를) 찾지 못했어요. '망원동', '강남역'처럼 입력해 보세요.`;return}
+    here=[+j[0].lat,+j[0].lon];searchNearby()}
+  catch(e){msg.textContent="위치를 찾지 못했어요. 잠시 뒤 다시 시도해 주세요."}
 }
 $("form").addEventListener("submit",e=>{e.preventDefault();recommend()});
 $("region").addEventListener("input",renderLinks);
+$("loc-form").addEventListener("submit",e=>{e.preventDefault();const r=$("region").value.trim();if(r)geocode(r);else $("region").focus()});
 $("gps").onclick=()=>{
   const msg=$("loc-msg");
-  if(!navigator.geolocation){msg.textContent="이 브라우저에서는 위치를 확인할 수 없습니다. 동네 이름을 직접 입력해 주세요.";return}
-  msg.textContent="현재 위치를 확인하는 중입니다…";
+  if(!navigator.geolocation){msg.textContent="이 브라우저에서는 위치를 확인할 수 없어요. 동네 이름을 직접 입력해 주세요.";return}
+  msg.textContent="현재 위치를 확인하는 중이에요…";
   navigator.geolocation.getCurrentPosition(
-    p=>{const {latitude:a,longitude:o}=p.coords;$("region").value="";msg.textContent=`현재 위치(${a.toFixed(3)}, ${o.toFixed(3)})를 확인했습니다. 아래 지도 링크가 내 주변을 기준으로 검색합니다.`;renderLinks()},
-    ()=>{msg.textContent="위치 권한이 없어 현재 위치를 쓸 수 없습니다. 동네 이름을 직접 입력해 주세요. ";$("region").focus()},
-    {timeout:6000});
+    p=>{here=[p.coords.latitude,p.coords.longitude];$("region").value="";renderLinks();searchNearby()},
+    ()=>{msg.textContent="위치 권한이 없어 현재 위치를 쓸 수 없어요. 동네 이름을 직접 입력해 주세요.";$("region").focus()},
+    {timeout:8000});
 };
+initMap();
 recommend();
 </script>
 
